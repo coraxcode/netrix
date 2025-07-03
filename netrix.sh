@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Universal Network Configuration Script - Professional Edition
+# Universal NETrix - Network Configuration Script - Professional Edition
 # Compatible with ALL Linux distributions (systemd/non-systemd)
-# Author: Senior Network Engineer
+# Author: Seehrum
 # Version: 4.0 - Production Ready
 
 # Root privileges check
