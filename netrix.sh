@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Universal NETrix - Network Configuration Script - Professional Edition
+# Universal NETrix v5.2 - Professional Network Configuration Script
 # Compatible with ALL Linux distributions (systemd/non-systemd)
+# Optimized for base system compatibility and universal usage
 # Author: Seehrum
-# Version: 4.0 - Production Ready
 
 # Root privileges check
 [[ $EUID -ne 0 ]] && { echo "Error: Run as root - sudo $0"; exit 1; }
@@ -25,9 +25,9 @@ readonly LOG_FILE="/var/log/network-config.log"
 SELECTED_INTERFACE=""
 SELECTED_SSID=""
 WIFI_PASSWORD=""
-
-# DNS servers (Primary, Secondary, Fallback)
-readonly DNS_SERVERS=("8.8.8.8" "1.1.1.1" "9.9.9.9" "208.67.222.222")
+DETECTED_DISTRO=""
+PREFERRED_DHCP=""
+WIFI_COUNTRY=""
 
 # Cleanup handler
 cleanup() {
@@ -36,20 +36,81 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Enhanced logging for errors
-log_error() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >> "$LOG_FILE" 2>/dev/null
+# Enhanced logging
+log_info() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
 }
 
-log_info() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - INFO: $1" >> "$LOG_FILE" 2>/dev/null
+# Professional distribution detection
+detect_distribution() {
+    local distro="unknown"
+    if [[ -f /etc/void-release ]]; then
+        distro="void"
+    elif [[ -f /etc/alpine-release ]]; then
+        distro="alpine"
+    elif [[ -f /etc/arch-release ]]; then
+        distro="arch"
+    elif [[ -f /etc/debian_version ]]; then
+        distro="debian"
+    elif [[ -f /etc/redhat-release ]]; then
+        distro="redhat"
+    elif [[ -f /etc/openwrt_release ]]; then
+        distro="openwrt"
+    fi
+    DETECTED_DISTRO="$distro"
+    log_info "Detected distribution: $distro"
+}
+
+# Get preferred DHCP client by distribution
+get_preferred_dhcp_client() {
+    case "$DETECTED_DISTRO" in
+        "void"|"arch") echo "dhcpcd" ;;
+        "alpine"|"openwrt") echo "udhcpc" ;;
+        "debian"|"redhat") 
+            command -v dhclient >/dev/null 2>&1 && echo "dhclient" || echo "dhcpcd" ;;
+        *) 
+            command -v dhclient >/dev/null 2>&1 && echo "dhclient" || echo "dhcpcd" ;;
+    esac
+}
+
+# Detect WiFi country code
+detect_wifi_country() {
+    local country="US"
+    if command -v curl >/dev/null 2>&1; then
+        country=$(timeout 5 curl -s "http://ipinfo.io/country" 2>/dev/null | head -1 | tr -d '\n\r' | grep -E '^[A-Z]{2}$' || echo "US")
+    elif [[ -f /etc/timezone ]]; then
+        local tz=$(cat /etc/timezone 2>/dev/null)
+        case "$tz" in
+            Europe/*) country="DE" ;;
+            America/*) country="US" ;;
+            Asia/*) country="JP" ;;
+            Australia/*) country="AU" ;;
+        esac
+    fi
+    [[ ${#country} -eq 2 ]] && [[ "$country" =~ ^[A-Z]{2}$ ]] && WIFI_COUNTRY="$country" || WIFI_COUNTRY="US"
+}
+
+# Check CapsLock status - Bug Fix #2
+check_capslock_status() {
+    local capslock_status="OFF"
+    if command -v xset >/dev/null 2>&1; then
+        xset q 2>/dev/null | grep -q "Caps Lock:.*on" && capslock_status="ON"
+    elif [[ -f /sys/class/leds/input*::capslock/brightness ]]; then
+        local brightness=$(cat /sys/class/leds/input*::capslock/brightness 2>/dev/null | head -1)
+        [[ "$brightness" == "1" ]] && capslock_status="ON"
+    fi
+    
+    if [[ "$capslock_status" == "ON" ]]; then
+        dialog --title "CapsLock Warning" --msgbox "WARNING: CapsLock is currently ON!\n\nThis may cause issues with WiFi password entry.\nPlease disable CapsLock and try again." 9 50
+        return 1
+    fi
+    return 0
 }
 
 # Universal service management
 manage_service() {
     local action=$1
     local service=$2
-    
     if command -v systemctl >/dev/null 2>&1; then
         systemctl $action $service 2>/dev/null
     elif command -v service >/dev/null 2>&1; then
@@ -61,47 +122,51 @@ manage_service() {
     fi
 }
 
-# Enhanced DNS configuration with multiple fallbacks
+# Intelligent DNS configuration
 configure_dns() {
     local primary_dns=${1:-"8.8.8.8"}
     local secondary_dns=${2:-"1.1.1.1"}
     
-    # Backup current resolv.conf
-    [[ -f "$RESOLV_CONF" ]] && cp "$RESOLV_CONF" "$RESOLV_BACKUP" 2>/dev/null
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        command -v resolvectl >/dev/null 2>&1 && resolvectl dns "$SELECTED_INTERFACE" "$primary_dns" "$secondary_dns" 2>/dev/null && return 0
+    fi
     
-    # Create new resolv.conf with multiple DNS servers
+    [[ -f "$RESOLV_CONF" ]] && cp "$RESOLV_CONF" "$RESOLV_BACKUP" 2>/dev/null
+    command -v chattr >/dev/null 2>&1 && chattr -i "$RESOLV_CONF" 2>/dev/null
+    
     cat > "$RESOLV_CONF" << EOF
 nameserver $primary_dns
 nameserver $secondary_dns
 nameserver 9.9.9.9
-nameserver 208.67.222.222
-options timeout:2 attempts:3 rotate
+options timeout:2 attempts:3
 EOF
     
-    # Set immutable flag to prevent dhcp override
-    chattr +i "$RESOLV_CONF" 2>/dev/null || true
-    return 0
+    command -v chattr >/dev/null 2>&1 && chattr +i "$RESOLV_CONF" 2>/dev/null
+    log_info "DNS configured: $primary_dns, $secondary_dns"
 }
 
-# Complete network process cleanup with enhanced error handling
+# Enhanced network process cleanup with full interface reset
 kill_network_processes() {
     local interface=$1
     
-    # Kill DHCP clients silently
+    # Kill all network processes
     pkill -f "dhclient.*$interface" 2>/dev/null
-    pkill -f "udhcpc.*$interface" 2>/dev/null
     pkill -f "dhcpcd.*$interface" 2>/dev/null
-    
-    # Kill WiFi processes silently
+    pkill -f "udhcpc.*$interface" 2>/dev/null
     pkill -f "wpa_supplicant.*$interface" 2>/dev/null
     
-    # Clean WPA control interface
+    # Clean up control directories
     rm -rf "$WPA_CTRL_DIR/$interface" 2>/dev/null
     
-    # Flush interface addresses
+    # Complete interface reset - Bug Fix #1
     ip addr flush dev "$interface" 2>/dev/null
-    
+    ip route del default dev "$interface" 2>/dev/null
+    ip link set "$interface" down 2>/dev/null
     sleep 2
+    ip link set "$interface" up 2>/dev/null
+    sleep 2
+    
+    log_info "Network processes killed and interface $interface reset"
 }
 
 # Get network interfaces by type
@@ -109,7 +174,7 @@ get_interfaces() {
     local type=$1
     case $type in
         "ethernet")
-            ip link show 2>/dev/null | awk '/^[0-9]+: (eth|en|em)/ {gsub(/:/, "", $2); print $2}'
+            ip link show 2>/dev/null | awk '/^[0-9]+: (eth|en|em|enp|eno|ens)/ {gsub(/:/, "", $2); print $2}'
             ;;
         "wireless")
             for dev in $(ls /sys/class/net/ 2>/dev/null); do
@@ -122,7 +187,7 @@ get_interfaces() {
     esac
 }
 
-# Interface selection with enhanced validation
+# Interface selection
 select_interface() {
     local type=$1
     local -a interfaces=($(get_interfaces "$type"))
@@ -154,8 +219,8 @@ select_interface() {
 # Main menu
 main_menu() {
     while true; do
-        dialog --clear --title "Universal Network Configuration Tool" \
-            --menu "Select network configuration option:" \
+        dialog --clear --title "Universal NETrix v5.2 [$DETECTED_DISTRO]" \
+            --menu "Professional Network Configuration:" \
             15 60 8 \
             1 "Configure Ethernet Connection" \
             2 "Configure WiFi Connection" \
@@ -196,38 +261,24 @@ configure_ethernet() {
     esac
 }
 
-# DHCP configuration with enhanced error handling
+# Enhanced DHCP configuration
 configure_dhcp() {
-    dialog --infobox "Configuring DHCP on $SELECTED_INTERFACE..." 5 50
+    dialog --infobox "Configuring DHCP on $SELECTED_INTERFACE using $PREFERRED_DHCP..." 5 60
     
-    # Clean existing processes
     kill_network_processes "$SELECTED_INTERFACE"
     
-    # Reset interface
-    ip link set "$SELECTED_INTERFACE" down 2>/dev/null
-    sleep 1
-    ip link set "$SELECTED_INTERFACE" up 2>/dev/null
-    sleep 3
-    
-    # Start DHCP client
-    local dhcp_started=false
-    if command -v dhclient >/dev/null 2>&1; then
-        dhclient -r "$SELECTED_INTERFACE" >/dev/null 2>&1
-        dhclient "$SELECTED_INTERFACE" >/dev/null 2>&1 &
-        dhcp_started=true
-    elif command -v udhcpc >/dev/null 2>&1; then
-        udhcpc -i "$SELECTED_INTERFACE" -b >/dev/null 2>&1 &
-        dhcp_started=true
-    elif command -v dhcpcd >/dev/null 2>&1; then
-        dhcpcd "$SELECTED_INTERFACE" >/dev/null 2>&1 &
-        dhcp_started=true
-    fi
-    
-    [[ "$dhcp_started" == false ]] && {
-        log_error "No DHCP client found for $SELECTED_INTERFACE"
-        dialog --msgbox "No DHCP client found!" 8 40
-        return
-    }
+    # Start DHCP client based on distribution preference
+    case "$PREFERRED_DHCP" in
+        "dhclient")
+            command -v dhclient >/dev/null 2>&1 && dhclient "$SELECTED_INTERFACE" >/dev/null 2>&1 &
+            ;;
+        "dhcpcd")
+            command -v dhcpcd >/dev/null 2>&1 && dhcpcd "$SELECTED_INTERFACE" >/dev/null 2>&1 &
+            ;;
+        "udhcpc")
+            command -v udhcpc >/dev/null 2>&1 && udhcpc -i "$SELECTED_INTERFACE" -b >/dev/null 2>&1 &
+            ;;
+    esac
     
     # Wait for IP assignment
     local ip=""
@@ -240,14 +291,13 @@ configure_dhcp() {
     if [[ -n "$ip" ]]; then
         configure_dns
         log_info "DHCP configured successfully on $SELECTED_INTERFACE ($ip)"
-        dialog --msgbox "DHCP Configuration Successful!\n\nInterface: $SELECTED_INTERFACE\nIP Address: $ip\nDNS: Configured\nStatus: Connected" 10 50
+        dialog --msgbox "DHCP Configuration Successful!\n\nInterface: $SELECTED_INTERFACE\nIP Address: $ip\nDHCP Client: $PREFERRED_DHCP" 10 50
     else
-        log_error "DHCP configuration failed on $SELECTED_INTERFACE"
-        dialog --msgbox "DHCP Configuration Failed!\n\nCheck ethernet cable connection." 8 50
+        dialog --msgbox "DHCP Configuration Failed!\nCheck ethernet cable connection." 8 50
     fi
 }
 
-# Static IP configuration with validation
+# Static IP configuration
 configure_static_ip() {
     dialog --form "Static IP Configuration" 14 55 4 \
         "IP Address:" 1 1 "192.168.1.100" 1 15 15 15 \
@@ -259,26 +309,22 @@ configure_static_ip() {
     
     local -a values=($(cat "$TEMP_FILE"))
     local ip_addr="${values[0]}"
-    local netmask="${values[1]}"
     local gateway="${values[2]}"
     local dns="${values[3]}"
     
-    # Basic IP validation
+    # IP validation
     if ! [[ $ip_addr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         dialog --msgbox "Invalid IP address format!" 6 40
         return
     fi
     
-    # Apply configuration
     kill_network_processes "$SELECTED_INTERFACE"
     ip addr add "$ip_addr/24" dev "$SELECTED_INTERFACE" 2>/dev/null
     ip link set "$SELECTED_INTERFACE" up 2>/dev/null
     ip route add default via "$gateway" dev "$SELECTED_INTERFACE" 2>/dev/null
     
-    # Configure DNS with fallbacks
     configure_dns "$dns" "1.1.1.1"
-    
-    dialog --msgbox "Static IP Configuration Successful!\n\nInterface: $SELECTED_INTERFACE\nIP: $ip_addr\nGateway: $gateway\nDNS: $dns + fallbacks" 12 50
+    dialog --msgbox "Static IP Configuration Successful!\n\nInterface: $SELECTED_INTERFACE\nIP: $ip_addr\nGateway: $gateway" 10 50
 }
 
 # WiFi scanning with enhanced error handling
@@ -343,29 +389,40 @@ scan_wifi() {
     return 1
 }
 
-# WiFi configuration
+# WiFi configuration with CapsLock check and network reset - Bug Fix #1 & #2
 configure_wifi() {
+    # Reset all network connections first to avoid conflicts - Bug Fix #1
+    dialog --infobox "Resetting network connections to avoid conflicts..." 5 55
+    local -a all_interfaces=($(get_interfaces "all"))
+    for iface in "${all_interfaces[@]}"; do
+        kill_network_processes "$iface"
+    done
+    sleep 2
+    
     select_interface "wireless" || return
+    
+    # Check CapsLock status before password entry - Bug Fix #2
+    check_capslock_status || return
+    
     scan_wifi || return
     
-    dialog --passwordbox "Enter WiFi password for network:\n'$SELECTED_SSID'" 9 50 2>"$TEMP_FILE"
+    dialog --title "WiFi Password" --insecure --passwordbox "Enter WiFi password for network:\n'$SELECTED_SSID'" 9 50 2>"$TEMP_FILE"
     [[ $? -ne 0 ]] && return
     
     WIFI_PASSWORD=$(cat "$TEMP_FILE")
     connect_wifi
 }
 
-# WiFi connection with professional error handling
+# Enhanced WiFi connection
 connect_wifi() {
     dialog --infobox "Connecting to WiFi network: $SELECTED_SSID..." 5 55
     
-    kill_network_processes "$SELECTED_INTERFACE"
     mkdir -p "$WPA_CTRL_DIR" 2>/dev/null
     
     cat > "$WPA_CONFIG" << EOF
 ctrl_interface=$WPA_CTRL_DIR
 update_config=1
-country=US
+country=$WIFI_COUNTRY
 
 network={
     ssid="$SELECTED_SSID"
@@ -375,19 +432,19 @@ network={
 }
 EOF
     
-    # Start WPA supplicant with enhanced error suppression
+    # Start WPA supplicant
     if command -v wpa_supplicant >/dev/null 2>&1; then
-        wpa_supplicant -B -i "$SELECTED_INTERFACE" -c "$WPA_CONFIG" -D nl80211 -f /dev/null >/dev/null 2>&1 || \
-        wpa_supplicant -B -i "$SELECTED_INTERFACE" -c "$WPA_CONFIG" -D wext -f /dev/null >/dev/null 2>&1
+        wpa_supplicant -B -i "$SELECTED_INTERFACE" -c "$WPA_CONFIG" -D nl80211 >/dev/null 2>&1 || \
+        wpa_supplicant -B -i "$SELECTED_INTERFACE" -c "$WPA_CONFIG" -D wext >/dev/null 2>&1
         sleep 4
     fi
     
     # Get IP via DHCP
-    if command -v dhclient >/dev/null 2>&1; then
-        dhclient "$SELECTED_INTERFACE" >/dev/null 2>&1 &
-    elif command -v udhcpc >/dev/null 2>&1; then
-        udhcpc -i "$SELECTED_INTERFACE" -b >/dev/null 2>&1 &
-    fi
+    case "$PREFERRED_DHCP" in
+        "dhclient") command -v dhclient >/dev/null 2>&1 && dhclient "$SELECTED_INTERFACE" >/dev/null 2>&1 & ;;
+        "dhcpcd") command -v dhcpcd >/dev/null 2>&1 && dhcpcd "$SELECTED_INTERFACE" >/dev/null 2>&1 & ;;
+        "udhcpc") command -v udhcpc >/dev/null 2>&1 && udhcpc -i "$SELECTED_INTERFACE" -b >/dev/null 2>&1 & ;;
+    esac
     
     # Wait for IP
     local ip=""
@@ -400,24 +457,25 @@ EOF
     if [[ -n "$ip" ]]; then
         configure_dns
         log_info "WiFi connected successfully to $SELECTED_SSID ($ip)"
-        dialog --msgbox "WiFi Connection Successful!\n\nNetwork: $SELECTED_SSID\nInterface: $SELECTED_INTERFACE\nIP Address: $ip\nDNS: Configured with fallbacks" 12 50
+        dialog --msgbox "WiFi Connection Successful!\n\nNetwork: $SELECTED_SSID\nInterface: $SELECTED_INTERFACE\nIP Address: $ip\nCountry: $WIFI_COUNTRY" 12 55
     else
-        log_error "WiFi connection failed to $SELECTED_SSID on $SELECTED_INTERFACE"
-        dialog --msgbox "WiFi Connection Failed!\n\nCheck password and signal strength." 8 50
+        dialog --msgbox "WiFi Connection Failed!\nCheck password and signal strength." 8 50
     fi
 }
 
 # Network status display
 show_network_status() {
-    local status="=== NETWORK STATUS REPORT ===\n\n"
-    local -a interfaces=($(get_interfaces "all"))
+    local status="=== NETWORK STATUS REPORT ===\n"
+    status+="Distribution: $DETECTED_DISTRO\n"
+    status+="DHCP Client: $PREFERRED_DHCP\n"
+    status+="WiFi Country: $WIFI_COUNTRY\n\n"
     
+    local -a interfaces=($(get_interfaces "all"))
     for iface in "${interfaces[@]}"; do
         local ip=$(ip addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
         local state=$(ip link show "$iface" 2>/dev/null | grep -o "state [A-Z]*" | cut -d' ' -f2)
         
-        status+="Interface: $iface\n"
-        status+="Status: $state\n"
+        status+="Interface: $iface [$state]\n"
         status+="IP Address: ${ip:-"Not assigned"}\n"
         
         if [[ -d "/sys/class/net/$iface/wireless" ]]; then
@@ -430,83 +488,46 @@ show_network_status() {
     local gateway=$(ip route 2>/dev/null | grep default | head -1 | grep -oP 'via \K[\d.]+')
     [[ -n "$gateway" ]] && status+="Gateway: $gateway\n"
     
-    local dns=$(grep nameserver /etc/resolv.conf 2>/dev/null | head -1 | awk '{print $2}')
-    [[ -n "$dns" ]] && status+="Primary DNS: $dns\n"
-    
-    dialog --msgbox "$status" 20 55
+    dialog --msgbox "$status" 20 60
 }
 
-# Internet connectivity test with speed measurement
+# Enhanced connectivity test
 test_connectivity() {
-    dialog --infobox "Testing internet connectivity and speed..." 5 50
+    dialog --infobox "Testing internet connectivity..." 5 40
     
     local results="=== CONNECTIVITY TEST ===\n\n"
     
-    # Test gateway
     local gateway=$(ip route 2>/dev/null | grep default | head -1 | grep -oP 'via \K[\d.]+')
-    if [[ -n "$gateway" ]] && ping -c 2 -W 3 "$gateway" >/dev/null 2>&1; then
+    if [[ -n "$gateway" ]] && timeout 5 ping -c 2 -W 3 "$gateway" >/dev/null 2>&1; then
         results+="✓ Gateway: PASSED ($gateway)\n"
     else
         results+="✗ Gateway: FAILED\n"
-        log_error "Gateway test failed ($gateway)"
     fi
     
-    # Test internet
-    if ping -c 2 -W 5 8.8.8.8 >/dev/null 2>&1; then
+    if timeout 8 ping -c 2 -W 5 8.8.8.8 >/dev/null 2>&1; then
         results+="✓ Internet: PASSED\n"
     else
         results+="✗ Internet: FAILED\n"
-        log_error "Internet connectivity test failed"
     fi
     
-    # Test DNS
-    if nslookup google.com >/dev/null 2>&1; then
+    # DNS resolution test
+    local dns_ok=false
+    if command -v nslookup >/dev/null 2>&1; then
+        timeout 5 nslookup google.com >/dev/null 2>&1 && dns_ok=true
+    elif command -v dig >/dev/null 2>&1; then
+        timeout 5 dig google.com >/dev/null 2>&1 && dns_ok=true
+    fi
+    
+    if [[ "$dns_ok" == true ]]; then
         results+="✓ DNS Resolution: PASSED\n"
     else
         results+="✗ DNS Resolution: FAILED\n"
-        log_error "DNS resolution test failed"
     fi
     
-    # Speed test using basic download method
-    results+="\n=== SPEED TEST ===\n"
-    local speed="N/A"
-    
-    # Test download speed using wget or curl with timeout
-    if command -v wget >/dev/null 2>&1; then
-        local start_time=$(date +%s)
-        if timeout 10 wget -q -O /dev/null "http://speedtest.tele2.net/1MB.zip" 2>/dev/null; then
-            local end_time=$(date +%s)
-            local duration=$((end_time - start_time))
-            [[ $duration -gt 0 ]] && speed=$(( (1024 * 8) / duration )) && speed="${speed} Kbps"
-        fi
-    elif command -v curl >/dev/null 2>&1; then
-        local start_time=$(date +%s)
-        if timeout 10 curl -s -o /dev/null "http://speedtest.tele2.net/1MB.zip" 2>/dev/null; then
-            local end_time=$(date +%s)
-            local duration=$((end_time - start_time))
-            [[ $duration -gt 0 ]] && speed=$(( (1024 * 8) / duration )) && speed="${speed} Kbps"
-        fi
-    fi
-    
-    # Alternative speed test using ping latency
-    if [[ "$speed" == "N/A" ]]; then
-        local ping_time=$(ping -c 4 8.8.8.8 2>/dev/null | grep "avg" | cut -d'/' -f5 | cut -d'.' -f1)
-        if [[ -n "$ping_time" && $ping_time -lt 50 ]]; then
-            speed="Fast (${ping_time}ms latency)"
-        elif [[ -n "$ping_time" && $ping_time -lt 100 ]]; then
-            speed="Good (${ping_time}ms latency)"
-        elif [[ -n "$ping_time" ]]; then
-            speed="Slow (${ping_time}ms latency)"
-        fi
-    fi
-    
-    results+="Download Speed: $speed\n"
-    log_info "Connectivity test completed - Speed: $speed"
-    
-    dialog --msgbox "$results" 16 50
+    dialog --msgbox "$results" 12 50
 }
 
-# Network reset
+# Network reset with enhanced cleanup
 reset_network() {
     dialog --yesno "Reset all network configurations?" 8 40
     [[ $? -ne 0 ]] && return
@@ -516,21 +537,25 @@ reset_network() {
     local -a interfaces=($(get_interfaces "all"))
     for iface in "${interfaces[@]}"; do
         kill_network_processes "$iface"
-        ip link set "$iface" down 2>/dev/null
     done
     
     ip route flush table main 2>/dev/null
     rm -rf "$WPA_CTRL_DIR" 2>/dev/null
     
     # Restore DNS backup
-    chattr -i "$RESOLV_CONF" 2>/dev/null
-    [[ -f "$RESOLV_BACKUP" ]] && mv "$RESOLV_BACKUP" "$RESOLV_CONF"
-    
-    manage_service restart networking
+    if ! systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        command -v chattr >/dev/null 2>&1 && chattr -i "$RESOLV_CONF" 2>/dev/null
+        [[ -f "$RESOLV_BACKUP" ]] && mv "$RESOLV_BACKUP" "$RESOLV_CONF"
+    fi
     
     dialog --msgbox "Network reset completed!" 6 40
 }
 
+# Initialize system detection
+detect_distribution
+PREFERRED_DHCP=$(get_preferred_dhcp_client)
+detect_wifi_country
+
 # Main execution
-log_info "Universal Network Configuration Tool started"
+log_info "Universal NETrix v5.2 started - Distribution: $DETECTED_DISTRO, DHCP: $PREFERRED_DHCP, Country: $WIFI_COUNTRY"
 main_menu
